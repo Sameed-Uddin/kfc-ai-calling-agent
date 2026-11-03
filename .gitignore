@@ -1,0 +1,21 @@
+# Environment variables (contains your secret API key)
+.env
+
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Playwright browser profile / session cookies
+browser_profile/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local full-copy backups (they contain .env and browser data)
+search-agent-backup-*/
+
+# macOS
+.DS_Store
