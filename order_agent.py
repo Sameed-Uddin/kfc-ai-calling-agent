@@ -58,6 +58,9 @@ NUMBER_WORDS = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5"}
 # Give up quickly on an ADD button that can't be clicked (the agent can't talk while it waits)
 ADD_CLICK_TIMEOUT_MS = 3000
 
+# The same add_to_cart request again within this many seconds is treated as an accidental repeat
+DUPLICATE_ADD_WINDOW_S = 30
+
 # While the agent is speaking (and for a moment after), mic sound quieter than this is
 # replaced with silence: it is usually the agent's own voice leaking from the headphones.
 # Echo measured up to ~1600 RMS; direct speech into the mic reaches 3000-9000.
@@ -190,6 +193,8 @@ class KFCBrowserController:
         self.context = None
         self.page = None
         self.menu_titles = []
+        self.last_add = None
+        self.last_add_time = 0.0
 
     async def ensure_browser(self):
         """Opens visible Chrome browser if not already open."""
@@ -317,6 +322,39 @@ class KFCBrowserController:
         await self.page.wait_for_timeout(2000)
         return [text.strip().split("\n")[0].strip() for text in await self._menu_cards().all_inner_texts()]
 
+    async def show_menu(self, section: str = "") -> dict:
+        """Opens the full menu in Chrome, scrolls to a section, and returns what that section shows."""
+        await self.ensure_browser()
+        print(f"\n[Browser Action] Showing menu section: '{section or 'top'}'")
+        if "/menu" not in self.page.url:
+            await self._open("menu")
+        await self._search_menu("")
+
+        sections = self.page.locator('div[class*="scroll-mt"]')
+        headings = [text.strip().split("\n")[0] for text in await sections.all_inner_texts()]
+        if not section:
+            await self.page.evaluate("window.scrollTo(0, 0)")
+            return {"status": "success", "sections": headings, "instruction": "Tell the customer the menu is open in the browser and read out the section names."}
+
+        letters = lambda text: re.sub(r"[^a-z]", "", text.lower())
+        wanted = letters(section)
+        index = next((i for i, h in enumerate(headings) if wanted and (wanted in letters(h) or letters(h) in wanted)), None)
+        if index is None:
+            return {"status": "failed", "message": f"No menu section called '{section}'.", "sections": headings}
+
+        await sections.nth(index).scroll_into_view_if_needed()
+        items = []
+        for text in await sections.nth(index).locator("div.bg-cardbg").all_inner_texts():
+            lines = [line.strip() for line in text.split("\n") if line.strip()]
+            price = next((line for line in lines if line.upper().startswith("RS")), "")
+            items.append(f"{lines[0]} ({price})" if price else lines[0])
+        return {
+            "status": "success",
+            "section": headings[index],
+            "items": items,
+            "instruction": "Tell the customer this section is showing in the browser. Read out a few items with prices, not the whole list, unless they ask. Do not add anything until they order."
+        }
+
     async def add_to_cart(self, items: list[str]) -> dict:
         """Adds items matched by name, checking the cart count after each one."""
         await self.ensure_browser()
@@ -328,6 +366,17 @@ class KFCBrowserController:
 
         if not self.menu_titles:
             self.menu_titles = await self._search_menu("")
+
+        # The model has re-sent the same add when the customer only said "can you hear me?"
+        request = sorted(str(item).strip().lower() for item in items)
+        if request == self.last_add and time.monotonic() - self.last_add_time < DUPLICATE_ADD_WINDOW_S:
+            print(f"⚠️ Blocked a repeat of the add just done: {items}")
+            self.last_add_time = 0.0
+            return {
+                "status": "blocked",
+                "message": "This exact add was done a moment ago, so nothing was added again.",
+                "instruction": "Do not say anything was added. If the customer clearly wants more of it, call add_to_cart again or use update_cart_item with the new total."
+            }
 
         state.on_cart_changed()
         before = {row["item"]: row["quantity"] for row in await self._read_cart_rows()}
@@ -404,6 +453,10 @@ class KFCBrowserController:
             else:
                 print(f"⚠️ Cart shows {got}x {title} added, expected {qty}.")
                 problems.append(f"{title}: the cart shows {got} added instead of {qty}.")
+        if added:
+            self.last_add, self.last_add_time = request, time.monotonic()
+        # Leave the full menu showing instead of the last search result
+        await self.page.locator('input[placeholder*="Search"]').first.fill("")
 
         return {
             "status": "success" if added and not problems else "partial" if added else "failed",
@@ -516,6 +569,9 @@ def update_cart_item(item: str, quantity: int) -> dict:
 def read_cart() -> dict:
     """Returns what is really in the cart right now."""
 
+def show_menu(section: str) -> dict:
+    """Shows the KFC menu in the customer's browser and returns the items and prices in that section. Sections: Promotion, Everyday Value, Ala-Carte & Combos, Signature Boxes, Sharing, Condiments (dips and sauces), Snacks & Beverages (drinks, fries, desserts), Midnight. Use an empty section to show the top of the menu and list the sections."""
+
 def get_receipt_total() -> dict:
     """Goes to the KFC checkout page and returns the subtotal, delivery fee, and total. Only call this once the customer says they are done adding items."""
 
@@ -528,7 +584,7 @@ def set_instructions(text: str) -> dict:
 def place_order() -> dict:
     """Clicks Checkout so the customer can finish in the browser. WARNING: Only call this if the customer says YES to "Should I place this order?"."""
 
-ORDERING_TOOLS = [add_to_cart, update_cart_item, read_cart, get_receipt_total, set_payment_method, set_instructions, place_order]
+ORDERING_TOOLS = [add_to_cart, update_cart_item, read_cart, show_menu, get_receipt_total, set_payment_method, set_instructions, place_order]
 TOOL_NAMES = {tool.__name__ for tool in ORDERING_TOOLS}
 
 
@@ -555,7 +611,10 @@ Rules for the whole call:
 - Keep numbers in item names: "Deal 2" is a different item from "Deal 1". The word "to" or "too" right after a name may be a misheard "2". If you are not sure of the number, ask before adding. If a tool result says a name matches several items, read those items out and ask which one.
 - If an item can't be added right now, say that plainly and tell the customer the reason from the tool result, including any start time. Do not make up a reason.
 - Check before guessing: if you did not clearly catch an item, ask the customer to repeat it. Vague or odd phrases like "all kinds of mayo" or "some sauces" are not an order: ask exactly which item and how many before calling `add_to_cart`. Never invent a quantity, except that "a Pepsi" or just "Pepsi" means one.
-- "No" is not always "done": treat them as done only when they clearly say they want nothing more or want to check out. "No, keep one only" is a cart change. If you are not sure which they mean, ask.
+- Showing the menu: when the customer wants to see the menu, a section, or what's available ("open the menu", "show me the drinks", "go to deals"), call `show_menu` with the closest section. You can show the menu; never say you can't.
+- "No" is not always "done": treat them as done only when they clearly say they want nothing more or want to check out. A "no" that answers something else, or that shows they are annoyed ("no, man", "no, open the menu"), is not done: do what they asked instead. "No, keep one only" is a cart change. If you are not sure which they mean, ask.
+- Follow the customer: if they ask for something else while you are on the payment or instructions questions, do that first, then come back. Do not repeat the payment question over their request.
+- Only add when they order: "can you hear me?", "hello?", or "I did it" is not an order, so never call `add_to_cart` again for it. Answer them instead.
 - Noise: if you hear a stray word, a fragment, or words that repeat what you just said, it is probably background noise or your own voice. Do not greet again and do not act on it. Briefly ask "Sorry, what was that?"
 """
 
