@@ -18,6 +18,7 @@ import asyncio
 import os
 import re
 import sys
+import time
 import traceback
 from difflib import SequenceMatcher
 
@@ -56,6 +57,17 @@ NUMBER_WORDS = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5"}
 
 # Give up quickly on an ADD button that can't be clicked (the agent can't talk while it waits)
 ADD_CLICK_TIMEOUT_MS = 3000
+
+# While the agent is speaking (and for a moment after), mic sound quieter than this is
+# replaced with silence: it is usually the agent's own voice leaking from the headphones.
+# Echo measured up to ~1600 RMS; direct speech into the mic reaches 3000-9000.
+BARGE_IN_RMS = 2000
+ECHO_TAIL_S = 0.3
+_last_playback = 0.0
+
+# Reconnecting after Gemini drops the connection; the handle lets it keep the conversation
+MAX_RECONNECTS = 3
+_resume_handle = None
 
 
 def _sound_key(word: str) -> str:
@@ -102,8 +114,8 @@ def _pick_title(name: str, titles: list[str]) -> tuple:
     return tied[0], []
 
 
-def _print_mic_level(raw_bytes: bytes):
-    """Compute RMS of a 16-bit PCM chunk and print a live meter bar."""
+def _print_mic_level(raw_bytes: bytes) -> float:
+    """Compute RMS of a 16-bit PCM chunk, print a live meter bar, and return the RMS."""
     audio = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
     rms = np.sqrt(np.mean(audio ** 2))
     # Scale to 0-30 character bar (max int16 RMS ~32768, speech ~1000-5000)
@@ -112,6 +124,7 @@ def _print_mic_level(raw_bytes: bytes):
     bar = "▇" * level + "░" * (30 - level)
     sys.stdout.write(f"\r🎤 Mic [{bar}] RMS:{int(rms):>5}  ")
     sys.stdout.flush()
+    return rms
 
 
 class OrderSessionState:
@@ -317,6 +330,7 @@ class KFCBrowserController:
             self.menu_titles = await self._search_menu("")
 
         state.on_cart_changed()
+        before = {row["item"]: row["quantity"] for row in await self._read_cart_rows()}
         added, problems = [], []
         for raw_item in items:
             # Parse quantity and item name: e.g. "2 Zinger Burgers" -> qty=2, name="Zinger Burger"
@@ -363,7 +377,7 @@ class KFCBrowserController:
 
             gained = await self._cart_count() - count_before
             if gained == qty:
-                added.append(f"{qty}x {title}")
+                added.append((title, qty))
             elif not clickable:
                 print(f"⚠️ '{title}' can't be added right now.")
                 start_time = await self._section_start_time(card)
@@ -375,6 +389,21 @@ class KFCBrowserController:
                 # A dialog left open would block the next item
                 await self.page.keyboard.press("Escape")
                 await self.page.wait_for_timeout(500)
+
+        # The item counter has disagreed with the cart before, so confirm against the cart rows
+        expected = {}
+        for title, qty in added:
+            expected[title] = expected.get(title, 0) + qty
+        await self.page.wait_for_timeout(1000)
+        after = {row["item"]: row["quantity"] for row in await self._read_cart_rows()}
+        added = []
+        for title, qty in expected.items():
+            got = after.get(title, 0) - before.get(title, 0)
+            if got == qty:
+                added.append(f"{qty}x {title}")
+            else:
+                print(f"⚠️ Cart shows {got}x {title} added, expected {qty}.")
+                problems.append(f"{title}: the cart shows {got} added instead of {qty}.")
 
         return {
             "status": "success" if added and not problems else "partial" if added else "failed",
@@ -536,25 +565,15 @@ async def mic_stream_loop(session, input_queue: asyncio.Queue, stop_event: async
     while not stop_event.is_set():
         try:
             chunk = await asyncio.wait_for(input_queue.get(), timeout=0.1)
-            if chunk:
-                # Send raw 16kHz PCM audio chunk to Gemini
-                await session.send_realtime_input(
-                    audio=types.Blob(
-                        data=chunk,
-                        mime_type="audio/pcm;rate=16000"
-                    )
-                )
         except asyncio.TimeoutError:
             continue
-        except Exception as e:
-            if not stop_event.is_set():
-                print(f"\n❌ Mic Stream Error [{type(e).__name__}]: {e}")
-                traceback.print_exc()
-            break
+        # A send failure means the connection dropped, so let it raise and trigger a reconnect
+        await session.send_realtime_input(audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000"))
 
 
 async def speaker_playback_loop(output_stream: sd.RawOutputStream, output_queue: asyncio.Queue, stop_event: asyncio.Event):
     """Plays received 24kHz PCM audio chunks through speakers."""
+    global _last_playback
     while not stop_event.is_set():
         try:
             audio_data = await asyncio.wait_for(output_queue.get(), timeout=0.05)
@@ -564,6 +583,7 @@ async def speaker_playback_loop(output_stream: sd.RawOutputStream, output_queue:
                 if generation != _playback_generation:
                     break
                 await asyncio.to_thread(output_stream.write, audio_data[offset:offset + PLAYBACK_SLICE_BYTES])
+                _last_playback = time.monotonic()
         except asyncio.TimeoutError:
             continue
         except Exception as e:
@@ -578,17 +598,20 @@ async def receive_server_loop(session, output_queue: asyncio.Queue, stop_event: 
     while not stop_event.is_set():
         got_messages = await receive_turn(session, output_queue, stop_event, enable_tools)
         if not got_messages:
-            print("\n⚠️ Gemini closed the connection.")
-            stop_event.set()
+            raise ConnectionError("Gemini closed the connection")
 
 
 async def receive_turn(session, output_queue: asyncio.Queue, stop_event: asyncio.Event, enable_tools: bool) -> bool:
     """Receives one model turn: audio, transcripts, and tool calls from Gemini."""
+    global _playback_generation, _resume_handle
     got_messages = False
     async for message in session.receive():
         got_messages = True
         if stop_event.is_set():
             break
+
+        if message.session_resumption_update and message.session_resumption_update.new_handle:
+            _resume_handle = message.session_resumption_update.new_handle
 
         # 1. Handle Server Content (Audio, Interruption, Transcripts)
         if message.server_content:
@@ -600,7 +623,6 @@ async def receive_turn(session, output_queue: asyncio.Queue, stop_event: asyncio
                 while not output_queue.empty():
                     output_queue.get_nowait()
                 # Don't abort the stream here: it crashes a write running in the playback thread
-                global _playback_generation
                 _playback_generation += 1
 
             if sc.input_transcription and sc.input_transcription.text:
@@ -642,8 +664,34 @@ async def receive_turn(session, output_queue: asyncio.Queue, stop_event: asyncio
     return got_messages
 
 
+async def run_connection(session, input_queue: asyncio.Queue, output_queue: asyncio.Queue, stop_event: asyncio.Event, enable_tools: bool):
+    """Runs the mic and receive loops for one connection. Raises if the connection drops."""
+    tasks = [
+        asyncio.create_task(mic_stream_loop(session, input_queue, stop_event)),
+        asyncio.create_task(receive_server_loop(session, output_queue, stop_event, enable_tools)),
+    ]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    # Collect the other loop's outcome too, so its error isn't reported as "never retrieved"
+    await asyncio.gather(*pending, return_exceptions=True)
+    for task in done:
+        task.result()
+
+
+async def _reconnect_note(enable_tools: bool) -> str:
+    """Tells the model the line dropped, with the real cart in case it lost the conversation."""
+    cart = (await browser_ctrl.read_cart())["cart"] if enable_tools else []
+    return (
+        "(System note, not the customer: the call connection dropped for a moment and is back. "
+        f"The real cart right now is: {cart}. Do not greet again. Briefly say the line dropped, "
+        "and continue from where you were. If you don't remember, read back the cart and ask what they'd like next.)"
+    )
+
+
 async def run_live_voice_session(enable_tools: bool = True, input_device=None, output_device=None):
     """Sets up sounddevice streams and runs the Gemini Live session."""
+    global _resume_handle
     if not API_KEY or API_KEY.strip() == "" or API_KEY == "your_gemini_api_key_here":
         print("\n❌ Error: GEMINI_API_KEY is not set in your .env file.")
         return
@@ -690,7 +738,9 @@ async def run_live_voice_session(enable_tools: bool = True, input_device=None, o
         if status:
             print(f"\n⚠️ Mic status: {status}")
         raw = bytes(indata)
-        _print_mic_level(raw)
+        rms = _print_mic_level(raw)
+        if time.monotonic() - _last_playback < ECHO_TAIL_S and rms < BARGE_IN_RMS:
+            raw = bytes(len(raw))
         loop.call_soon_threadsafe(input_queue.put_nowait, raw)
 
     try:
@@ -703,16 +753,31 @@ async def run_live_voice_session(enable_tools: bool = True, input_device=None, o
         output_stream = sd.RawOutputStream(samplerate=OUTPUT_SAMPLE_RATE, device=output_device, **stream_args)
 
         with input_stream, output_stream:
-            async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
-                print("[✅ Gemini Live session connected]\n")
-
-                await session.send_realtime_input(text="Hello! I am calling to order food from KFC.")
-
-                await asyncio.gather(
-                    mic_stream_loop(session, input_queue, stop_event),
-                    speaker_playback_loop(output_stream, output_queue, stop_event),
-                    receive_server_loop(session, output_queue, stop_event, enable_tools),
-                )
+            speaker = asyncio.create_task(speaker_playback_loop(output_stream, output_queue, stop_event))
+            for attempt in range(MAX_RECONNECTS + 1):
+                config.session_resumption = types.SessionResumptionConfig(handle=_resume_handle)
+                try:
+                    async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
+                        if attempt == 0:
+                            print("[✅ Gemini Live session connected]\n")
+                            await session.send_realtime_input(text="Hello! I am calling to order food from KFC.")
+                        else:
+                            print("[✅ Reconnected]\n")
+                            await session.send_realtime_input(text=await _reconnect_note(enable_tools))
+                        await run_connection(session, input_queue, output_queue, stop_event, enable_tools)
+                    break
+                except Exception as e:
+                    if attempt == MAX_RECONNECTS:
+                        raise
+                    print(f"\n⚠️ Lost connection to Gemini ({type(e).__name__}: {e}). Reconnecting...")
+                    # After a sudden drop Gemini may still hold the old session and refuse to
+                    # resume it, so start a fresh one (the reconnect note carries the cart over)
+                    if "already connected" in str(e):
+                        _resume_handle = None
+                    while not input_queue.empty():
+                        input_queue.get_nowait()
+                    await asyncio.sleep(2 ** attempt)
+            speaker.cancel()
 
     except Exception as e:
         if not stop_event.is_set():
