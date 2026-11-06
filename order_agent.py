@@ -250,14 +250,22 @@ class KFCBrowserController:
     async def ensure_browser(self):
         """Opens visible Chrome browser if not already open."""
         if self.page is None:
-            print("\n🌐 Opening visible Chrome window (saved profile)...")
+            print("\n🌐 Opening Google Chrome (the agent's saved profile, so logins stay)...")
             self.playwright = await async_playwright().start()
-            self.context = await self.playwright.chromium.launch_persistent_context(
+            # Chrome won't let automation use your everyday profile, so the agent keeps its own
+            # in browser_profile/. Log in to KFC there once and it stays logged in.
+            options = dict(
                 user_data_dir=self.profile_dir,
                 headless=False,
-                viewport={"width": 1280, "height": 800},
+                no_viewport=True,
                 args=["--start-maximized"],
+                ignore_default_args=["--enable-automation"],
             )
+            try:
+                self.context = await self.playwright.chromium.launch_persistent_context(channel="chrome", **options)
+            except Exception as e:
+                print(f"⚠️ Google Chrome didn't start ({type(e).__name__}), using Playwright's browser instead.")
+                self.context = await self.playwright.chromium.launch_persistent_context(**options)
             self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
 
     async def _open(self, path: str):
@@ -897,6 +905,18 @@ async def run_live_voice_session(enable_tools: bool = True, input_device=None, o
             await browser_ctrl.close()
 
 
+async def login_once():
+    """Opens the agent's Chrome on KFC and waits until the window is closed; the login is saved."""
+    await browser_ctrl.ensure_browser()
+    await browser_ctrl.page.goto(KFC_URL)
+    print("🔑 Log in to KFC and set your delivery address, then close the Chrome window.")
+    # On a Mac, Chrome keeps running after its last window closes, so watch the tabs instead
+    while browser_ctrl.context.pages:
+        await asyncio.sleep(1)
+    await browser_ctrl.close()
+    print("✅ Saved. The agent will stay logged in from now on.")
+
+
 def _print_device(label: str, device, default_index: int):
     """Prints the name of the chosen audio device, or the system default."""
     if device is None:
@@ -916,8 +936,14 @@ def main():
                         help="Sounddevice output (speaker) device ID (e.g., 2)")
     parser.add_argument("--test", action="store_true",
                         help="Voice-only test mode (no browser/tools)")
+    parser.add_argument("--login", action="store_true",
+                        help="Open the agent's Chrome on KFC to log in once, no call")
 
     args, _ = parser.parse_known_args()
+
+    if args.login:
+        asyncio.run(login_once())
+        return
 
     print()
     _print_device("Input ", args.input, 0)
