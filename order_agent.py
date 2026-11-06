@@ -59,6 +59,10 @@ NUMBER_WORDS = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5"}
 # Give up quickly on an ADD button that can't be clicked (the agent can't talk while it waits)
 ADD_CLICK_TIMEOUT_MS = 3000
 
+# Words ignored by search_menu, and how many results it returns
+SEARCH_STOP_WORDS = "deal deals the a an and with which that has have having include includes including all me some item items one ones kfc menu any what whats in of for or too also get got there their something anything like want show find contain contains"
+MAX_SEARCH_RESULTS = 8
+
 # The same add_to_cart request again within this many seconds is treated as an accidental repeat
 DUPLICATE_ADD_WINDOW_S = 30
 
@@ -68,7 +72,10 @@ DUPLICATE_ADD_WINDOW_S = 30
 # ECHO_MARGIN, which is what lets it work through speakers too.
 BARGE_IN_RMS = 2000
 ECHO_WINDOW_S = 0.5
-ECHO_MARGIN = 2.0
+ECHO_MARGIN = 1.5
+# Which percentile of measured echo ratios to trust: high enough to cover echo peaks,
+# low enough that the customer talking over the agent doesn't count as echo
+ECHO_PERCENTILE = 90
 # Assume speakers until the agent's first words show how loud its echo really is
 START_ECHO_RATIO = 1.0
 MIN_ECHO_SAMPLES = 10
@@ -138,6 +145,7 @@ class EchoGate:
         self.played = deque(maxlen=40)   # (time, rms) of recently played 50ms slices
         self.ratios = deque(maxlen=200)  # mic rms / played rms while the agent talks
         self.reported = False
+        self.latency = 0.0               # seconds between writing audio and hearing it
 
     def on_played(self, chunk: bytes):
         self.played.append((time.monotonic(), _rms(chunk)))
@@ -145,13 +153,14 @@ class EchoGate:
     def echo_ratio(self) -> float:
         if len(self.ratios) < MIN_ECHO_SAMPLES:
             return START_ECHO_RATIO
-        # The median ignores the few moments the customer talks over the agent
-        return float(np.median(self.ratios))
+        # A high percentile covers echo peaks but ignores the few moments the customer talks over the agent
+        return float(np.percentile(self.ratios, ECHO_PERCENTILE))
 
     def filter(self, raw: bytes, mic_rms: float) -> bytes:
         """Returns the mic chunk, or silence if it is probably the agent's echo."""
         now = time.monotonic()
-        recent = [rms for played_at, rms in self.played if now - played_at < ECHO_WINDOW_S]
+        # A slice can be heard any time from when it's written until the speaker delay plus room echo has passed
+        recent = [rms for played_at, rms in self.played if now - played_at < self.latency + ECHO_WINDOW_S]
         if not recent:
             return raw
         played_rms = max(recent)
@@ -244,6 +253,7 @@ class KFCBrowserController:
         self.context = None
         self.page = None
         self.menu_titles = []
+        self.menu_index = []
         self.last_add = None
         self.last_add_time = 0.0
 
@@ -279,6 +289,7 @@ class KFCBrowserController:
         await self.clear_cart()
         await self._open("menu")
         self.menu_titles = await self._search_menu("")
+        self.menu_index = await self._read_menu_index()
         print(f"📋 Read {len(self.menu_titles)} items from the menu.")
 
     async def clear_cart(self):
@@ -381,6 +392,54 @@ class KFCBrowserController:
         await self.page.wait_for_timeout(2000)
         return [text.strip().split("\n")[0].strip() for text in await self._menu_cards().all_inner_texts()]
 
+    async def _read_menu_index(self) -> list[dict]:
+        """Name, price, section and description of every menu item (the description is the picture's alt text)."""
+        return await self.page.evaluate("""() =>
+            [...document.querySelectorAll('div[class*="scroll-mt"]')].flatMap(section => {
+                const heading = section.innerText.trim().split("\\n")[0];
+                return [...section.querySelectorAll("div.bg-cardbg")].map(card => {
+                    const lines = card.innerText.split("\\n").map(line => line.trim()).filter(Boolean);
+                    const alts = [...card.querySelectorAll("img[alt]")].map(img => img.alt).filter(alt => alt && alt !== lines[0]);
+                    return {
+                        item: lines[0],
+                        price: (lines.find(line => /^RS/i.test(line)) || "").replace(/^RS\\s*/i, "") + " rupees",
+                        section: heading,
+                        about: alts.sort((a, b) => b.length - a.length)[0] || "",
+                    };
+                });
+            })""")
+
+    async def search_menu(self, query: str) -> dict:
+        """Finds menu items whose name, section or description mention the query's words."""
+        await self.ensure_browser()
+        print(f"\n[Browser Action] Searching the menu for: '{query}'")
+        if not self.menu_index:
+            if "/menu" not in self.page.url:
+                await self._open("menu")
+            await self._search_menu("")
+            self.menu_index = await self._read_menu_index()
+
+        stop_words = set(_sound_words(SEARCH_STOP_WORDS))
+        words = [word for word in _sound_words(query) if word not in stop_words]
+        if not words:
+            return {"status": "failed", "message": "Say what to look for, like 'zinger strips' or 'drinks'."}
+
+        def hits(entry):
+            text = _sound_words(f"{entry['item']} {entry['section']} {entry['about']}")
+            return sum(any(SequenceMatcher(None, word, other).ratio() >= MATCH_THRESHOLD for other in text) for word in words)
+
+        scored = [(hits(entry), entry) for entry in self.menu_index]
+        best = max(score for score, _ in scored)
+        if best == 0:
+            return {"status": "failed", "message": f"Nothing on the menu mentions '{query}'."}
+        found = [entry for score, entry in scored if score == best][:MAX_SEARCH_RESULTS]
+        return {
+            "status": "success",
+            "matched_all_words": best == len(words),
+            "items": found,
+            "instruction": "Tell the customer the matching items with prices, briefly saying what's in each. If matched_all_words is false, say these are the closest matches. Do not add anything until they choose."
+        }
+
     async def show_menu(self, section: str = "") -> dict:
         """Opens the full menu in Chrome, scrolls to a section, and returns what that section shows."""
         await self.ensure_browser()
@@ -406,7 +465,7 @@ class KFCBrowserController:
         for text in await sections.nth(index).locator("div.bg-cardbg").all_inner_texts():
             lines = [line.strip() for line in text.split("\n") if line.strip()]
             price = next((line for line in lines if line.upper().startswith("RS")), "")
-            items.append(f"{lines[0]} ({price})" if price else lines[0])
+            items.append(f"{lines[0]} ({price[2:].strip()} rupees)" if price else lines[0])
         return {
             "status": "success",
             "section": headings[index],
@@ -542,10 +601,13 @@ class KFCBrowserController:
         state.on_total_read(receipt["total"])
         print(f"🧾 Subtotal: {receipt['subtotal']} | Delivery: {receipt['delivery_fee']} | Total: {receipt['total']}")
 
+        # The voice has read "Rs" as dollars, so spell the currency out
+        spoken = {key: re.sub(r"^Rs\.?\s*", "", value, flags=re.IGNORECASE) + " rupees" if value != "N/A" else value
+                  for key, value in receipt.items()}
         return {
             "cart": await self._read_cart_rows(),
-            **receipt,
-            "instruction": "Read the total clearly to the customer, then continue with the payment and instructions questions."
+            **spoken,
+            "instruction": "Read the total clearly to the customer in rupees (never dollars), then continue with the payment and instructions questions."
         }
 
     async def set_payment_method(self, cash_on_delivery: bool = True) -> dict:
@@ -628,6 +690,9 @@ def update_cart_item(item: str, quantity: int) -> dict:
 def read_cart() -> dict:
     """Returns what is really in the cart right now."""
 
+def search_menu(query: str) -> dict:
+    """Searches every menu item's name, section and description (what's inside it) for these words. Example queries: 'zinger strips', 'wings', 'coleslaw', 'family'. Returns matching items with prices and descriptions."""
+
 def show_menu(section: str) -> dict:
     """Shows the KFC menu in the customer's browser and returns the items and prices in that section. Sections: Promotion, Everyday Value, Ala-Carte & Combos, Signature Boxes, Sharing, Condiments (dips and sauces), Snacks & Beverages (drinks, fries, desserts), Midnight. Use an empty section to show the top of the menu and list the sections."""
 
@@ -643,13 +708,15 @@ def set_instructions(text: str) -> dict:
 def place_order() -> dict:
     """Clicks Checkout so the customer can finish in the browser. WARNING: Only call this if the customer says YES to "Should I place this order?"."""
 
-ORDERING_TOOLS = [add_to_cart, update_cart_item, read_cart, show_menu, get_receipt_total, set_payment_method, set_instructions, place_order]
+ORDERING_TOOLS = [add_to_cart, update_cart_item, read_cart, search_menu, show_menu, get_receipt_total, set_payment_method, set_instructions, place_order]
 TOOL_NAMES = {tool.__name__ for tool in ORDERING_TOOLS}
 
 
 SYSTEM_PROMPT = """You are a friendly, natural voice food-ordering assistant for KFC.
 You are talking with the customer over a live telephone call.
 Keep your spoken responses short, friendly, and conversational (like a drive-thru or phone agent).
+Only say what the customer should hear. Never say your plans, reasoning, or notes about the customer out loud.
+This is KFC Pakistan: every price is in Pakistani rupees. Always say "rupees", never "dollars".
 
 Your order workflow:
 1. Greet the customer warmly and ask what they would like to order.
@@ -667,9 +734,10 @@ Rules for the whole call:
 - Changing the cart: when the customer wants to remove an item or change a quantity, at any step, call `update_cart_item` with the total quantity they want. If you already read a total, call `get_receipt_total` again afterwards and read the new total.
 - Never claim the cart changed unless a tool result in this conversation shows it. If there is no tool for what they asked, say you can't do it.
 - Menu names: you do not know the menu, so never say an item is missing and never suggest an item unless a tool result shows it. When the customer corrects a name or its spelling, call `add_to_cart` again with the corrected name, every time, even if the last attempt failed.
-- Keep numbers in item names: "Deal 2" is a different item from "Deal 1". The word "to" or "too" right after a name may be a misheard "2". If you are not sure of the number, ask before adding. If a tool result says a name matches several items, read those items out and ask which one.
+- Keep numbers in item names: "Deal 2" is a different item from "Deal 1". Only for numbered items like "Deal 2" or "Chicky Meal 2", the word "to" or "too" right after the name may be a misheard "2". Otherwise "too" means "also": "a Pepsi too" is one Pepsi. If you are not sure of the number, ask before adding. If a tool result says a name matches several items, read those items out and ask which one.
 - If an item can't be added right now, say that plainly and tell the customer the reason from the tool result, including any start time. Do not make up a reason.
 - Check before guessing: if you did not clearly catch an item, ask the customer to repeat it. Vague or odd phrases like "all kinds of mayo" or "some sauces" are not an order: ask exactly which item and how many before calling `add_to_cart`. Never invent a quantity, except that "a Pepsi" or just "Pepsi" means one.
+- Finding items: when the customer asks what's in a deal, which items include something ("deals with strips and Zinger"), or describes an item without its name, call `search_menu` with the key food words. Do not guess a section instead.
 - Showing the menu: when the customer wants to see the menu, a section, or what's available ("open the menu", "show me the drinks", "go to deals"), call `show_menu` with the closest section. You can show the menu; never say you can't.
 - "No" is not always "done": treat them as done only when they clearly say they want nothing more or want to check out. A "no" that answers something else, or that shows they are annoyed ("no, man", "no, open the menu"), is not done: do what they asked instead. "No, keep one only" is a cart change. If you are not sure which they mean, ask.
 - Follow the customer: if they ask for something else while you are on the payment or instructions questions, do that first, then come back. Do not repeat the payment question over their request.
@@ -824,7 +892,12 @@ async def run_live_voice_session(enable_tools: bool = True, input_device=None, o
     # Configure the Multimodal Live Session
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
-        input_audio_transcription=types.AudioTranscriptionConfig(),
+        # Without language codes the transcript sometimes came out in Spanish, Portuguese or Hindi
+        # (Urdu speech still showed in Hindi script with "ur-PK" added, so it is English only).
+        # (Menu names as custom_vocabulary were tried too, but they turned "a Pepsi too" into "Pepsi Regular".)
+        input_audio_transcription=types.AudioTranscriptionConfig(language_codes=["en-US"]),
+        # Its planning was once spoken aloud ("I will greet them and ask..."), so keep thoughts out of replies
+        thinking_config=types.ThinkingConfig(include_thoughts=False),
         output_audio_transcription=types.AudioTranscriptionConfig(),
         # Low sensitivity so background mic noise doesn't count as the customer interrupting
         realtime_input_config=types.RealtimeInputConfig(
@@ -867,6 +940,7 @@ async def run_live_voice_session(enable_tools: bool = True, input_device=None, o
         stream_args = {"channels": CHANNELS, "dtype": "int16", "blocksize": CHUNK_SIZE}
         input_stream = sd.RawInputStream(samplerate=INPUT_SAMPLE_RATE, device=input_device, callback=mic_callback, **stream_args)
         output_stream = sd.RawOutputStream(samplerate=OUTPUT_SAMPLE_RATE, device=output_device, **stream_args)
+        echo_gate.latency = output_stream.latency
 
         with input_stream, output_stream:
             speaker = asyncio.create_task(speaker_playback_loop(output_stream, output_queue, stop_event))
