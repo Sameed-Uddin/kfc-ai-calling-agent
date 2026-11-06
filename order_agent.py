@@ -20,6 +20,7 @@ import re
 import sys
 import time
 import traceback
+from collections import deque
 from difflib import SequenceMatcher
 
 import numpy as np
@@ -61,12 +62,16 @@ ADD_CLICK_TIMEOUT_MS = 3000
 # The same add_to_cart request again within this many seconds is treated as an accidental repeat
 DUPLICATE_ADD_WINDOW_S = 30
 
-# While the agent is speaking (and for a moment after), mic sound quieter than this is
-# replaced with silence: it is usually the agent's own voice leaking from the headphones.
-# Echo measured up to ~1600 RMS; direct speech into the mic reaches 3000-9000.
+# While the agent is speaking (and for a moment after), mic sound that could be its own voice
+# coming back is replaced with silence. The bar is the higher of BARGE_IN_RMS (headphone leak
+# measured up to ~1600; direct speech reaches 3000-9000) and the learned echo level times
+# ECHO_MARGIN, which is what lets it work through speakers too.
 BARGE_IN_RMS = 2000
-ECHO_TAIL_S = 0.3
-_last_playback = 0.0
+ECHO_WINDOW_S = 0.5
+ECHO_MARGIN = 2.0
+# Assume speakers until the agent's first words show how loud its echo really is
+START_ECHO_RATIO = 1.0
+MIN_ECHO_SAMPLES = 10
 
 # Reconnecting after Gemini drops the connection; the handle lets it keep the conversation
 MAX_RECONNECTS = 3
@@ -117,10 +122,56 @@ def _pick_title(name: str, titles: list[str]) -> tuple:
     return tied[0], []
 
 
+def _rms(raw_bytes: bytes) -> float:
+    """Loudness (RMS) of a 16-bit PCM chunk."""
+    audio = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
+    return float(np.sqrt(np.mean(audio ** 2))) if audio.size else 0.0
+
+
+class EchoGate:
+    """Keeps the agent from hearing its own voice, with headphones or speakers.
+
+    It learns how loud the agent's voice comes back into the mic compared with how loud it
+    was played (the echo ratio). Headphones leak little, so normal speech gets through;
+    speakers echo a lot, so you need to speak clearly over the agent to interrupt it."""
+    def __init__(self):
+        self.played = deque(maxlen=40)   # (time, rms) of recently played 50ms slices
+        self.ratios = deque(maxlen=200)  # mic rms / played rms while the agent talks
+        self.reported = False
+
+    def on_played(self, chunk: bytes):
+        self.played.append((time.monotonic(), _rms(chunk)))
+
+    def echo_ratio(self) -> float:
+        if len(self.ratios) < MIN_ECHO_SAMPLES:
+            return START_ECHO_RATIO
+        # The median ignores the few moments the customer talks over the agent
+        return float(np.median(self.ratios))
+
+    def filter(self, raw: bytes, mic_rms: float) -> bytes:
+        """Returns the mic chunk, or silence if it is probably the agent's echo."""
+        now = time.monotonic()
+        recent = [rms for played_at, rms in self.played if now - played_at < ECHO_WINDOW_S]
+        if not recent:
+            return raw
+        played_rms = max(recent)
+        if played_rms > 300:
+            self.ratios.append(mic_rms / played_rms)
+            if not self.reported and len(self.ratios) >= MIN_ECHO_SAMPLES:
+                self.reported = True
+                ratio = self.echo_ratio()
+                print(f"\n🔊 Echo ratio {ratio:.2f}: sounds like {'strong echo, speak up to interrupt' if ratio > 0.2 else 'low echo, normal speech can interrupt'}.")
+        if mic_rms >= max(BARGE_IN_RMS, self.echo_ratio() * played_rms * ECHO_MARGIN):
+            return raw
+        return bytes(len(raw))
+
+
+echo_gate = EchoGate()
+
+
 def _print_mic_level(raw_bytes: bytes) -> float:
     """Compute RMS of a 16-bit PCM chunk, print a live meter bar, and return the RMS."""
-    audio = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
-    rms = np.sqrt(np.mean(audio ** 2))
+    rms = _rms(raw_bytes)
     # Scale to 0-30 character bar (max int16 RMS ~32768, speech ~1000-5000)
     level = int(rms / 1500 * 30)
     level = min(level, 30)
@@ -632,7 +683,6 @@ async def mic_stream_loop(session, input_queue: asyncio.Queue, stop_event: async
 
 async def speaker_playback_loop(output_stream: sd.RawOutputStream, output_queue: asyncio.Queue, stop_event: asyncio.Event):
     """Plays received 24kHz PCM audio chunks through speakers."""
-    global _last_playback
     while not stop_event.is_set():
         try:
             audio_data = await asyncio.wait_for(output_queue.get(), timeout=0.05)
@@ -641,8 +691,9 @@ async def speaker_playback_loop(output_stream: sd.RawOutputStream, output_queue:
             for offset in range(0, len(audio_data or b""), PLAYBACK_SLICE_BYTES):
                 if generation != _playback_generation:
                     break
-                await asyncio.to_thread(output_stream.write, audio_data[offset:offset + PLAYBACK_SLICE_BYTES])
-                _last_playback = time.monotonic()
+                chunk = audio_data[offset:offset + PLAYBACK_SLICE_BYTES]
+                await asyncio.to_thread(output_stream.write, chunk)
+                echo_gate.on_played(chunk)
         except asyncio.TimeoutError:
             continue
         except Exception as e:
@@ -797,9 +848,7 @@ async def run_live_voice_session(enable_tools: bool = True, input_device=None, o
         if status:
             print(f"\n⚠️ Mic status: {status}")
         raw = bytes(indata)
-        rms = _print_mic_level(raw)
-        if time.monotonic() - _last_playback < ECHO_TAIL_S and rms < BARGE_IN_RMS:
-            raw = bytes(len(raw))
+        raw = echo_gate.filter(raw, _print_mic_level(raw))
         loop.call_soon_threadsafe(input_queue.put_nowait, raw)
 
     try:
