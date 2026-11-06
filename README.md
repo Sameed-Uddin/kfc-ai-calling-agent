@@ -1,4 +1,4 @@
-# KFC Voice Ordering Agent
+# KFC AI Calling Agent
 
 Order KFC Pakistan by talking to an AI. You speak, it listens, and it adds items to your cart on the real KFC website in Chrome, then hands checkout over to you.
 
@@ -35,8 +35,8 @@ Gemini doesn't see the screen. The program gives it a set of tools, Gemini decid
 Requires Python 3.11+, Google Chrome, and a mic.
 
 ```bash
-git clone https://github.com/Sameed-Uddin/search-agent.git
-cd search-agent
+git clone https://github.com/Sameed-Uddin/kfc-ai-calling-agent.git
+cd kfc-ai-calling-agent
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
